@@ -43,7 +43,7 @@ func TestParseArray(t *testing.T) {
 		}},
 		{`{axyzb}`, `xyz`, []int{2}, [][]byte{{'a'}, {'b'}}},
 	} {
-		dims, elems, err := parseArray([]byte(tt.input), []byte(tt.delim))
+		dims, elems, done, err := parseArray([]byte(tt.input), []byte(tt.delim))
 
 		if err != nil {
 			t.Fatalf("Expected no error for %q, got %q", tt.input, err)
@@ -54,6 +54,8 @@ func TestParseArray(t *testing.T) {
 		if !reflect.DeepEqual(elems, tt.elems) {
 			t.Errorf("Expected %v elements for %q, got %v", tt.elems, tt.input, elems)
 		}
+
+		done()
 	}
 }
 
@@ -77,7 +79,7 @@ func TestParseArrayError(t *testing.T) {
 		{`{""x}`, "unexpected 'x' at offset 3"},
 		{`{{a},{b,c}}`, "multidimensional arrays must have elements with matching dimensions"},
 	} {
-		_, _, err := parseArray([]byte(tt.input), []byte{','})
+		_, _, done, err := parseArray([]byte(tt.input), []byte{','})
 
 		if err == nil {
 			t.Fatalf("Expected error for %q, got none", tt.input)
@@ -85,6 +87,8 @@ func TestParseArrayError(t *testing.T) {
 		if !strings.Contains(err.Error(), tt.err) {
 			t.Errorf("Expected error to contain %q for %q, got %q", tt.err, tt.input, err)
 		}
+
+		done()
 	}
 }
 

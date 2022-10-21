@@ -707,6 +707,7 @@ func (cn *conn) simpleQuery(q string) (res *rows, err error) {
 			if res == nil {
 				res = &rows{
 					cn: cn,
+					rb: readBufPool.Get().(*readBuf),
 				}
 			}
 			// Set the result and tag to the last command complete if there wasn't a
@@ -737,7 +738,10 @@ func (cn *conn) simpleQuery(q string) (res *rows, err error) {
 		case 'T':
 			// res might be non-nil here if we received a previous
 			// CommandComplete, but that's fine; just overwrite it
-			res = &rows{cn: cn}
+			res = &rows{
+				cn: cn,
+				rb: readBufPool.Get().(*readBuf),
+			}
 			res.rowsHeader = parsePortalRowDescribe(r)
 
 			// To work around a bug in QueryRow in Go 1.2 and earlier, wait
@@ -894,7 +898,10 @@ func (cn *conn) query(query string, args []driver.Value) (_ *rows, err error) {
 
 		cn.readParseResponse()
 		cn.readBindResponse()
-		rows := &rows{cn: cn}
+		rows := &rows{
+			cn: cn,
+			rb: readBufPool.Get().(*readBuf),
+		}
 		rows.rowsHeader = cn.readPortalDescribeResponse()
 		cn.postExecuteWorkaround()
 		return rows, nil
@@ -904,6 +911,7 @@ func (cn *conn) query(query string, args []driver.Value) (_ *rows, err error) {
 	return &rows{
 		cn:         cn,
 		rowsHeader: st.rowsHeader,
+		rb:         readBufPool.Get().(*readBuf),
 	}, nil
 }
 
@@ -1394,6 +1402,7 @@ func (st *stmt) query(v []driver.Value) (r *rows, err error) {
 	return &rows{
 		cn:         st.cn,
 		rowsHeader: st.rowsHeader,
+		rb:         readBufPool.Get().(*readBuf),
 	}, nil
 }
 
@@ -1509,12 +1518,18 @@ type rowsHeader struct {
 	colFmts  []format
 }
 
+var readBufPool = sync.Pool{
+	New: func() interface{} {
+		return &readBuf{}
+	},
+}
+
 type rows struct {
 	cn     *conn
 	finish func()
 	rowsHeader
 	done   bool
-	rb     readBuf
+	rb     *readBuf
 	result driver.Result
 	tag    string
 
@@ -1535,6 +1550,11 @@ func (rs *rows) Close() error {
 			// description, used with HasNextResultSet). We need to fetch messages until
 			// we hit a 'Z', which is done by waiting for done to be set.
 			if rs.done {
+				if rs.rb != nil {
+					*rs.rb = (*rs.rb)[:0]
+					readBufPool.Put(rs.rb)
+					rs.rb = nil
+				}
 				return nil
 			}
 		default:
@@ -1570,17 +1590,17 @@ func (rs *rows) Next(dest []driver.Value) (err error) {
 	defer conn.errRecover(&err)
 
 	for {
-		t := conn.recv1Buf(&rs.rb)
+		t := conn.recv1Buf(rs.rb)
 		switch t {
 		case 'E':
-			err = parseError(&rs.rb)
+			err = parseError(rs.rb)
 		case 'C', 'I':
 			if t == 'C' {
 				rs.result, rs.tag = conn.parseComplete(rs.rb.string())
 			}
 			continue
 		case 'Z':
-			conn.processReadyForQuery(&rs.rb)
+			conn.processReadyForQuery(rs.rb)
 			rs.done = true
 			if err != nil {
 				return err
@@ -1605,7 +1625,7 @@ func (rs *rows) Next(dest []driver.Value) (err error) {
 			}
 			return
 		case 'T':
-			next := parsePortalRowDescribe(&rs.rb)
+			next := parsePortalRowDescribe(rs.rb)
 			rs.next = &next
 			return io.EOF
 		default:
@@ -1631,10 +1651,10 @@ func (rs *rows) NextResultSet() error {
 // QuoteIdentifier quotes an "identifier" (e.g. a table or a column name) to be
 // used as part of an SQL statement.  For example:
 //
-//    tblname := "my_table"
-//    data := "my_data"
-//    quoted := pq.QuoteIdentifier(tblname)
-//    err := db.Exec(fmt.Sprintf("INSERT INTO %s VALUES ($1)", quoted), data)
+//	tblname := "my_table"
+//	data := "my_data"
+//	quoted := pq.QuoteIdentifier(tblname)
+//	err := db.Exec(fmt.Sprintf("INSERT INTO %s VALUES ($1)", quoted), data)
 //
 // Any double quotes in name will be escaped.  The quoted identifier will be
 // case sensitive when used in a query.  If the input string contains a zero
@@ -1651,8 +1671,8 @@ func QuoteIdentifier(name string) string {
 // to DDL and other statements that do not accept parameters) to be used as part
 // of an SQL statement.  For example:
 //
-//    exp_date := pq.QuoteLiteral("2023-01-05 15:00:00Z")
-//    err := db.Exec(fmt.Sprintf("CREATE ROLE my_user VALID UNTIL %s", exp_date))
+//	exp_date := pq.QuoteLiteral("2023-01-05 15:00:00Z")
+//	err := db.Exec(fmt.Sprintf("CREATE ROLE my_user VALID UNTIL %s", exp_date))
 //
 // Any single quotes in name will be escaped. Any backslashes (i.e. "\") will be
 // replaced by two backslashes (i.e. "\\") and the C-style escape identifier

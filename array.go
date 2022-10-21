@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 var typeByteSlice = reflect.TypeOf([]byte{})
@@ -19,10 +20,11 @@ var typeSQLScanner = reflect.TypeOf((*sql.Scanner)(nil)).Elem()
 // slice of any dimension.
 //
 // For example:
-//  db.Query(`SELECT * FROM t WHERE id = ANY($1)`, pq.Array([]int{235, 401}))
 //
-//  var x []sql.NullInt64
-//  db.QueryRow(`SELECT ARRAY[235, 401]`).Scan(pq.Array(&x))
+//	db.Query(`SELECT * FROM t WHERE id = ANY($1)`, pq.Array([]int{235, 401}))
+//
+//	var x []sql.NullInt64
+//	db.QueryRow(`SELECT ARRAY[235, 401]`).Scan(pq.Array(&x))
 //
 // Scanning multi-dimensional arrays is not supported.  Arrays where the lower
 // bound is not one (such as `[0:0]={1}') are not supported.
@@ -91,10 +93,14 @@ func (a *BoolArray) Scan(src interface{}) error {
 }
 
 func (a *BoolArray) scanBytes(src []byte) error {
-	elems, err := scanLinearArray(src, []byte{','}, "BoolArray")
+	elems, done, err := scanLinearArray(src, []byte{','}, "BoolArray")
 	if err != nil {
+		if done != nil {
+			done()
+		}
 		return err
 	}
+	defer done()
 	if *a != nil && len(elems) == 0 {
 		*a = (*a)[:0]
 	} else {
@@ -165,10 +171,14 @@ func (a *ByteaArray) Scan(src interface{}) error {
 }
 
 func (a *ByteaArray) scanBytes(src []byte) error {
-	elems, err := scanLinearArray(src, []byte{','}, "ByteaArray")
+	elems, done, err := scanLinearArray(src, []byte{','}, "ByteaArray")
 	if err != nil {
+		if done != nil {
+			done()
+		}
 		return err
 	}
+	defer done()
 	if *a != nil && len(elems) == 0 {
 		*a = (*a)[:0]
 	} else {
@@ -237,10 +247,14 @@ func (a *Float64Array) Scan(src interface{}) error {
 }
 
 func (a *Float64Array) scanBytes(src []byte) error {
-	elems, err := scanLinearArray(src, []byte{','}, "Float64Array")
+	elems, done, err := scanLinearArray(src, []byte{','}, "Float64Array")
 	if err != nil {
+		if done != nil {
+			done()
+		}
 		return err
 	}
+	defer done()
 	if *a != nil && len(elems) == 0 {
 		*a = (*a)[:0]
 	} else {
@@ -299,10 +313,14 @@ func (a *Float32Array) Scan(src interface{}) error {
 }
 
 func (a *Float32Array) scanBytes(src []byte) error {
-	elems, err := scanLinearArray(src, []byte{','}, "Float32Array")
+	elems, done, err := scanLinearArray(src, []byte{','}, "Float32Array")
 	if err != nil {
+		if done != nil {
+			done()
+		}
 		return err
 	}
+	defer done()
 	if *a != nil && len(elems) == 0 {
 		*a = (*a)[:0]
 	} else {
@@ -417,10 +435,14 @@ func (a GenericArray) Scan(src interface{}) error {
 
 func (a GenericArray) scanBytes(src []byte, dv reflect.Value) error {
 	dtype, assign, del := a.evaluateDestination(dv.Type().Elem())
-	dims, elems, err := parseArray(src, []byte(del))
+	dims, elems, done, err := parseArray(src, []byte(del))
 	if err != nil {
+		if done != nil {
+			done()
+		}
 		return err
 	}
+	defer done()
 
 	// TODO allow multidimensional
 
@@ -517,10 +539,14 @@ func (a *Int64Array) Scan(src interface{}) error {
 }
 
 func (a *Int64Array) scanBytes(src []byte) error {
-	elems, err := scanLinearArray(src, []byte{','}, "Int64Array")
+	elems, done, err := scanLinearArray(src, []byte{','}, "Int64Array")
 	if err != nil {
+		if done != nil {
+			done()
+		}
 		return err
 	}
+	defer done()
 	if *a != nil && len(elems) == 0 {
 		*a = (*a)[:0]
 	} else {
@@ -578,10 +604,14 @@ func (a *Int32Array) Scan(src interface{}) error {
 }
 
 func (a *Int32Array) scanBytes(src []byte) error {
-	elems, err := scanLinearArray(src, []byte{','}, "Int32Array")
+	elems, done, err := scanLinearArray(src, []byte{','}, "Int32Array")
 	if err != nil {
+		if done != nil {
+			done()
+		}
 		return err
 	}
+	defer done()
 	if *a != nil && len(elems) == 0 {
 		*a = (*a)[:0]
 	} else {
@@ -641,10 +671,14 @@ func (a *StringArray) Scan(src interface{}) error {
 }
 
 func (a *StringArray) scanBytes(src []byte) error {
-	elems, err := scanLinearArray(src, []byte{','}, "StringArray")
+	elems, done, err := scanLinearArray(src, []byte{','}, "StringArray")
 	if err != nil {
+		if done != nil {
+			done()
+		}
 		return err
 	}
+	defer done()
 	if *a != nil && len(elems) == 0 {
 		*a = (*a)[:0]
 	} else {
@@ -772,17 +806,24 @@ func appendValue(b []byte, v driver.Value) ([]byte, error) {
 	return append(b, encode(nil, v, 0)...), nil
 }
 
+var elemsPool = sync.Pool{
+	New: func() interface{} {
+		return make([][]byte, 0)
+	},
+}
+
 // parseArray extracts the dimensions and elements of an array represented in
 // text format. Only representations emitted by the backend are supported.
 // Notably, whitespace around brackets and delimiters is significant, and NULL
 // is case-sensitive.
 //
 // See http://www.postgresql.org/docs/current/static/arrays.html#ARRAYS-IO
-func parseArray(src, del []byte) (dims []int, elems [][]byte, err error) {
+func parseArray(src, del []byte) (dims []int, elems [][]byte, done func(), err error) {
 	var depth, i int
+	done = func() {}
 
 	if len(src) < 1 || src[0] != '{' {
-		return nil, nil, fmt.Errorf("pq: unable to parse array; expected %q at offset %d", '{', 0)
+		return nil, nil, done, fmt.Errorf("pq: unable to parse array; expected %q at offset %d", '{', 0)
 	}
 
 Open:
@@ -792,7 +833,10 @@ Open:
 			depth++
 			i++
 		case '}':
-			elems = make([][]byte, 0)
+			elems = elemsPool.Get().([][]byte)
+			done = func() {
+				elemsPool.Put(elems[:0]) // nolint:staticcheck
+			}
 			goto Close
 		default:
 			break Open
@@ -835,7 +879,7 @@ Element:
 				if bytes.HasPrefix(src[i:], del) || src[i] == '}' {
 					elem := src[start:i]
 					if len(elem) == 0 {
-						return nil, nil, fmt.Errorf("pq: unable to parse array; unexpected %q at offset %d", src[i], i)
+						return nil, nil, done, fmt.Errorf("pq: unable to parse array; unexpected %q at offset %d", src[i], i)
 					}
 					if bytes.Equal(elem, []byte("NULL")) {
 						elem = nil
@@ -857,7 +901,7 @@ Element:
 			depth--
 			i++
 		} else {
-			return nil, nil, fmt.Errorf("pq: unable to parse array; unexpected %q at offset %d", src[i], i)
+			return nil, nil, done, fmt.Errorf("pq: unable to parse array; unexpected %q at offset %d", src[i], i)
 		}
 	}
 
@@ -867,7 +911,7 @@ Close:
 			depth--
 			i++
 		} else {
-			return nil, nil, fmt.Errorf("pq: unable to parse array; unexpected %q at offset %d", src[i], i)
+			return nil, nil, done, fmt.Errorf("pq: unable to parse array; unexpected %q at offset %d", src[i], i)
 		}
 	}
 	if depth > 0 {
@@ -883,13 +927,19 @@ Close:
 	return
 }
 
-func scanLinearArray(src, del []byte, typ string) (elems [][]byte, err error) {
-	dims, elems, err := parseArray(src, del)
+func scanLinearArray(src, del []byte, typ string) (elems [][]byte, done func(), err error) {
+	dims, elems, done, err := parseArray(src, del)
 	if err != nil {
-		return nil, err
+		if done != nil {
+			done()
+		}
+		return nil, nil, err
 	}
 	if len(dims) > 1 {
-		return nil, fmt.Errorf("pq: cannot convert ARRAY%s to %s", strings.Replace(fmt.Sprint(dims), " ", "][", -1), typ)
+		if done != nil {
+			done()
+		}
+		return nil, nil, fmt.Errorf("pq: cannot convert ARRAY%s to %s", strings.Replace(fmt.Sprint(dims), " ", "][", -1), typ)
 	}
-	return elems, err
+	return elems, done, err
 }
