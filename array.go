@@ -820,7 +820,10 @@ var elemsPool = sync.Pool{
 // See http://www.postgresql.org/docs/current/static/arrays.html#ARRAYS-IO
 func parseArray(src, del []byte) (dims []int, elems [][]byte, done func(), err error) {
 	var depth, i int
-	done = func() {}
+	elems = elemsPool.Get().([][]byte)
+	done = func() {
+		elemsPool.Put(elems[:0]) // nolint:staticcheck
+	}
 
 	if len(src) < 1 || src[0] != '{' {
 		return nil, nil, done, fmt.Errorf("pq: unable to parse array; expected %q at offset %d", '{', 0)
@@ -833,10 +836,6 @@ Open:
 			depth++
 			i++
 		case '}':
-			elems = elemsPool.Get().([][]byte)
-			done = func() {
-				elemsPool.Put(elems[:0]) // nolint:staticcheck
-			}
 			goto Close
 		default:
 			break Open
